@@ -1,9 +1,11 @@
 <#
-  一键构建（Windows x64 / MSVC / Ninja）
-  用法：
+  Build Dock (Windows x64, MSVC, Ninja).
+
+  Usage:
     powershell -ExecutionPolicy Bypass -File scripts\build.ps1
-  可选参数：
-    -VcVars   vcvars64.bat 的完整路径（默认自动查找 VS / Build Tools）
+
+  Optional:
+    -VcVars  full path to vcvars64.bat
 #>
 param([string]$VcVars = "")
 
@@ -34,16 +36,21 @@ function Find-VcVars {
 
 if (-not $VcVars) { $VcVars = Find-VcVars }
 if (-not $VcVars -or -not (Test-Path $VcVars)) {
-    throw "未找到 vcvars64.bat。请安装 Visual Studio 2022 Build Tools（C++ 桌面开发），或用 -VcVars 指定路径。"
+    throw "vcvars64.bat not found. Install Visual Studio 2022 Build Tools with 'Desktop development with C++', or pass -VcVars <path>."
 }
-if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-    throw "未找到 cmake。请安装 CMake 并加入 PATH（VS 安装器可选「C++ CMake tools」）。"
-}
+$vsRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $VcVars)))
+$vsCmake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+$vsNinja = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
+$cmake = if (Get-Command cmake -ErrorAction SilentlyContinue) { 'cmake' } elseif (Test-Path $vsCmake) { $vsCmake } else { $null }
+if (-not $cmake) { throw "cmake not found. Install CMake (the Visual Studio C++ workload includes it)." }
+$ninjaDir = if (Test-Path $vsNinja) { Split-Path -Parent $vsNinja } else { '' }
 
-Write-Host "使用 MSVC 环境：$VcVars"
-cmd /c "`"$VcVars`" >nul && cmake -S `"$root`" -B `"$root\build`" -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build `"$root\build`""
-if ($LASTEXITCODE -ne 0) { throw "构建失败（exit $LASTEXITCODE）" }
+Write-Host "Using MSVC environment: $VcVars"
+Write-Host "Using CMake: $cmake"
+$pathPrefix = if ($ninjaDir) { "set PATH=$ninjaDir;%PATH% && " } else { '' }
+cmd /c "`"$VcVars`" >nul && $pathPrefix`"$cmake`" -S `"$root`" -B `"$root\build`" -G Ninja -DCMAKE_BUILD_TYPE=Release && `"$cmake`" --build `"$root\build`""
+if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)" }
 
 $exe = Join-Path $root 'build\Dock.exe'
-if (-not (Test-Path $exe)) { throw "未生成 $exe" }
-Write-Host ("构建完成：{0}  ({1:N0} bytes)" -f $exe, (Get-Item $exe).Length)
+if (-not (Test-Path $exe)) { throw "Missing $exe" }
+Write-Host ("Build OK: {0}  ({1:N0} bytes)" -f $exe, (Get-Item $exe).Length)
