@@ -1,0 +1,23 @@
+# 构建与发布产物
+build/
+dist/
+out/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.zip
+
+# 本地配置（包含每台机器的绝对路径）
+dock-items.txt
+dock-settings.ini
+dock-debug.log
+
+# IDE / 系统
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+Thumbs.db
+Desktop.ini
+.DS_Store
