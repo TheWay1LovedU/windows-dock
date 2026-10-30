@@ -4,8 +4,8 @@
 1 ICON "app.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,11,0,0
-PRODUCTVERSION 1,11,0,0
+FILEVERSION 1,12,0,0
+PRODUCTVERSION 1,12,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -17,11 +17,11 @@ BEGIN
     BLOCK "080404B0"
     BEGIN
       VALUE "FileDescription", "Windows Dock 栏 - 原生轻量桌面 Dock"
-      VALUE "FileVersion", "1.11.0.0"
+            VALUE "FileVersion", "1.12.0.0"
       VALUE "InternalName", "Dock"
       VALUE "OriginalFilename", "Dock.exe"
       VALUE "ProductName", "Dock"
-      VALUE "ProductVersion", "1.11.0.0"
+            VALUE "ProductVersion", "1.12.0.0"
     END
   END
   BLOCK "VarFileInfo"

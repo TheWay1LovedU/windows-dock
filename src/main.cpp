@@ -1,6 +1,6 @@
 // dock/src/main.cpp
 // ---------------------------------------------------------------------------
-// Windows Dock —— v1.11
+// Windows Dock —— v1.12
 //   原生 C++20 / Win32 / Direct2D / DirectComposition
 //
 //   * 四边停靠：底部 / 顶部 / 左侧 / 右侧，自适应任意分辨率与任务栏
@@ -8,6 +8,8 @@
 //   * 托盘图标 + 右键菜单（位置、外观、图标大小、开机自启、刷新、退出）
 //   * 九宫格设置面板 + 日期时间信息块
 //   * 增删：拖放追加、右键移除、末尾「＋」添加
+//   * 文件夹二级栏：把游戏/工具归到一个图标里
+//   * 内置模块（时间 / 九宫格 / ＋）可单独隐藏
 //   * 真实图标（IShellItemImageFactory）+ 悬停弹簧放大
 //   * 便携配置（exe 同目录）；空闲 0 帧
 // ---------------------------------------------------------------------------
@@ -17,6 +19,7 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <commdlg.h>
 
 #include <d3d11.h>
@@ -33,6 +36,7 @@
 #include <gdiplus.h>
 
 #include <cmath>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <fstream>
@@ -80,15 +84,24 @@ constexpr UINT_PTR kSmartTimerId = 3;
 constexpr UINT_PTR kClockTimerId = 4;
 constexpr UINT_PTR kPopupWatchTimerId = 5;
 constexpr UINT_PTR kSystemTrayTimerId = 6;
+constexpr UINT_PTR kRevealTimerId = 7;
+constexpr UINT_PTR kGroupWatchTimerId = 8;
 constexpr UINT kAnimIntervalMs = 15;
 constexpr UINT kTrayMsg = WM_APP + 10;
 constexpr UINT kFullscreenCheckMsg = WM_APP + 11;
 constexpr UINT kFullscreenPollMs = 1000;
 constexpr UINT kSmartPollMs = 700;
+constexpr UINT kSmartRevealPollMs = 150;
 constexpr UINT kClockPollMs = 15000;
 constexpr UINT kPopupWatchMs = 80;
 constexpr UINT kSystemTrayPollMs = 220;
-constexpr int kRevealPad = 24;   // 鼠标靠近 Dock 区域多少像素内就浮出
+constexpr UINT kRevealPollMs = 100;     // 边缘热区检测频率（只在收起状态下运行）
+constexpr DWORD kRevealDwellMs = 450;   // 需在边缘停稳多久才浮出，避免误触
+constexpr DWORD kRevealLeaveMs = 350;   // 鼠标离开后多久重新收起
+constexpr int kHotEdgePx = 1;           // 热区厚度：只有真正顶到屏幕边缘才算
+constexpr int kRevealStillPx = 3;       // 停留期间允许的抖动范围
+constexpr DWORD kRevealCooldownMs = 800;  // 边缘处按下鼠标后，这段时间内不唤出
+constexpr DWORD kManualRevealMs = 3000;   // 遮挡中手动唤出后，3 秒无操作自动收起
 
 // 九宫格面板（物理像素会在绘制时乘以 DPI 缩放）
 constexpr float kPopupTileW = 86.0f;
@@ -119,12 +132,17 @@ enum : UINT {
     kCmdTaskbar = 44,
     kCmdHideFullscreen = 45,
     kCmdSmartHide = 46,
+    kCmdAddFolder = 47,
     kCmdOpenTray = 48,
+    kCmdEdgeReveal = 49,
     kCmdExit = 50,
     kCmdEdgeBottom = 60,
     kCmdEdgeTop = 61,
     kCmdEdgeLeft = 62,
     kCmdEdgeRight = 63,
+    kCmdShowClock = 70,
+    kCmdShowCenter = 71,
+    kCmdShowAdd = 72,
     kCmdRemoveBase = 100,
 };
 
@@ -169,6 +187,10 @@ struct Settings {
     bool reflection = true;  // 图标倒影
     bool hideFullscreen = true;  // 全屏应用时自动隐藏
     bool smartHide = true;       // 被窗口挡住时自动收起
+    bool showClock = true;       // 日期时间块
+    bool showCenter = true;      // 九宫格设置
+    bool showAdd = true;         // 「＋」添加位
+    bool edgeReveal = true;      // 自动收起后，鼠标顶到屏幕边缘可唤出
 };
 
 struct ItemAnim {
@@ -229,6 +251,8 @@ struct DockState {
     bool autoHidden = false;
     bool smartTimerOn = false;
     bool hoverRevealed = false;   // 因鼠标靠近而临时浮出（遮挡仍在）
+    DWORD revealHideAt = 0;       // 临时浮出的自动收起时间点
+    bool menuOpen = false;        // 右键菜单打开期间不自动收起
     bool winShown = true;         // 收起动画结束后彻底 SW_HIDE，桌面不留残影
     float slide = 0.0f;           // 0=完全显示, 1=完全收起（收起滑出动画）
     RECT baseRect{};              // 未收起时的窗口矩形
@@ -241,6 +265,14 @@ struct DockState {
     bool trayOverflowSeen = false;
     DWORD trayPeekStart = 0;
     HWND trayOverflow = nullptr;
+
+    // 边缘唤出：只有鼠标停在 Dock 朝屏幕一侧的窄条上并停留一小段时间才浮出。
+    bool revealTimerOn = false;
+    bool edgeArmed = false;
+    DWORD edgeEnterTick = 0;
+    DWORD revealLeaveTick = 0;
+    POINT edgeAnchorPt{};         // 停留判定的起始点，移动超过阈值就重新计时
+    DWORD revealCooldownUntil = 0;
 
     bool panelsShown = false;
     int popupHover = -1;
@@ -264,7 +296,38 @@ struct DockState {
     int cacheSlotCount = -1;
     int cacheEdge = -1;
     bool cacheReflection = false;
+    bool cacheShowClock = true;
+    bool cacheShowCenter = true;
+    bool cacheShowAdd = true;
     float cacheDpi = 0.0f;
+};
+
+// 文件夹二级栏：一个 dock 图标里收纳多个游戏 / 工具
+struct GroupState {
+    HWND hwnd = nullptr;
+    bool shown = false;
+    std::wstring root;                  // 当前浏览路径
+    std::wstring title;
+    std::vector<std::wstring> paths;
+    std::vector<bool> isDir;
+    std::vector<ComPtr<ID2D1Bitmap1>> icons;
+    std::vector<std::wstring> parents;  // 导航栈
+    int hover = -1;
+    int scrollRow = 0;
+    UINT w = 0;
+    UINT h = 0;
+    bool watchOn = false;
+    bool prevMouseDown = false;
+    bool prevEscapeDown = false;
+    ComPtr<IDCompositionTarget> target;
+    ComPtr<IDCompositionVisual> visual;
+    ComPtr<IDXGISwapChain1> swap;
+    ComPtr<ID2D1Bitmap1> bitmap;
+    ComPtr<IDWriteTextFormat> titleFmt;
+    ComPtr<IDWriteTextFormat> labelFmt;
+    ComPtr<IDWriteTextFormat> captionFmt;
+    ComPtr<ID2D1StrokeStyle> stroke;
+    float formatDpi = 0.0f;
 };
 
 struct PopupState {
@@ -293,6 +356,7 @@ struct PopupState {
 
 DockState g;
 PopupState gPopup;
+GroupState gGroup;
 Settings s;
 bool gDebug = false;
 // ------------------------------------------------------------------- misc ---
@@ -356,6 +420,21 @@ std::wstring FileNameOf(const std::wstring& path) {
     return name;
 }
 
+bool IsDirectoryPath(const std::wstring& path) {
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+// 二级栏里只列可启动的项目，避免被 dll / 配置 / 缓存文件淹没。
+bool IsLaunchableFile(const std::wstring& name) {
+    const size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    const std::wstring ext = name.substr(dot);
+    return _wcsicmp(ext.c_str(), L".exe") == 0 || _wcsicmp(ext.c_str(), L".lnk") == 0 ||
+           _wcsicmp(ext.c_str(), L".bat") == 0 || _wcsicmp(ext.c_str(), L".cmd") == 0 ||
+           _wcsicmp(ext.c_str(), L".url") == 0 || _wcsicmp(ext.c_str(), L".appref-ms") == 0;
+}
+
 // ----------------------------------------------------------------- config ---
 std::wstring ItemsPath() { return ExeDir() + L"\\dock-items.txt"; }
 std::wstring SettingsPath() { return ExeDir() + L"\\dock-settings.ini"; }
@@ -394,6 +473,10 @@ void LoadSettings() {
         else if (key == "reflection") s.reflection = (val == "1");
         else if (key == "hideFullscreen") s.hideFullscreen = (val == "1");
         else if (key == "smartHide") s.smartHide = (val == "1");
+        else if (key == "showClock") s.showClock = (val == "1");
+        else if (key == "showCenter") s.showCenter = (val == "1");
+        else if (key == "showAdd") s.showAdd = (val == "1");
+        else if (key == "edgeReveal") s.edgeReveal = (val == "1");
     }
     if (s.material < 0 || s.material > 3) s.material = 0;
     if (s.iconSize < 28 || s.iconSize > 72) s.iconSize = 44;
@@ -410,6 +493,10 @@ void SaveSettings() {
     out << "reflection=" << (s.reflection ? 1 : 0) << "\n";
     out << "hideFullscreen=" << (s.hideFullscreen ? 1 : 0) << "\n";
     out << "smartHide=" << (s.smartHide ? 1 : 0) << "\n";
+    out << "showClock=" << (s.showClock ? 1 : 0) << "\n";
+    out << "showCenter=" << (s.showCenter ? 1 : 0) << "\n";
+    out << "showAdd=" << (s.showAdd ? 1 : 0) << "\n";
+    out << "edgeReveal=" << (s.edgeReveal ? 1 : 0) << "\n";
 }
 
 int ItemCount();
@@ -433,6 +520,14 @@ void HandleCommand(int cmd);
 void ShowLabelFor(int index);
 void HideLabel();
 void LaunchItem(int index);
+LRESULT CALLBACK GroupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+void HideGroup();
+bool IsDockItemGroup(int index);
+void OpenGroupAtItem(int index);
+void RenderGroup();
+void GroupActivate(int index);
+void GroupGoBack();
+void GroupScroll(int delta);
 
 // ------------------------------------------------------------------ taskbar ---
 BOOL CALLBACK TaskbarEnumProc(HWND hwnd, LPARAM hide) {
@@ -611,6 +706,30 @@ ComPtr<ID2D1Bitmap1> WicToD2DBitmap(IWICBitmapSource* src) {
     return out;
 }
 
+// 文件夹条目：画一个系统风格的圆角文件夹，比空色块更易辨认，且无需解码位图。
+void DrawFolderGlyph(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush,
+                     const D2D1_RECT_F& r, float opacity) {
+    if (!dc || !brush) return;
+    const float w = r.right - r.left;
+    const float h = r.bottom - r.top;
+    const float bodyTop = r.top + h * 0.26f;
+    const float tabW = w * 0.46f;
+    const float tabH = h * 0.16f;
+    const float radius = std::max(2.0f, h * 0.10f);
+
+    brush->SetColor(D2D1::ColorF(0.99f, 0.78f, 0.36f, 0.95f * opacity));
+    const D2D1_ROUNDED_RECT tab{
+        D2D1::RectF(r.left + w * 0.06f, bodyTop - tabH, r.left + w * 0.06f + tabW, bodyTop + tabH),
+        radius, radius };
+    dc->FillRoundedRectangle(tab, brush);
+
+    const D2D1_ROUNDED_RECT body{
+        D2D1::RectF(r.left + w * 0.04f, bodyTop, r.right - w * 0.04f, r.bottom - h * 0.10f),
+        radius, radius };
+    brush->SetColor(D2D1::ColorF(1.00f, 0.86f, 0.48f, 0.98f * opacity));
+    dc->FillRoundedRectangle(body, brush);
+}
+
 // 预渲染"倒影"：垂直翻转 + 自上而下渐隐（预乘 alpha）。
 // 放在加载期做，绘制期只是 DrawBitmap，静止时依旧 0 帧、悬停动画零额外开销。
 ComPtr<IWICBitmap> MakeReflectionWic(IWICBitmapSource* src, UINT w, UINT h, float maxAlpha) {
@@ -683,10 +802,13 @@ void ReloadIcons() {
 
 // ------------------------------------------------------------------ layout ---
 int ItemCount() { return static_cast<int>(g.items.size()); }
-int ClockIndex() { return ItemCount(); }             // 日期时间信息块
-int CenterIndex() { return ItemCount() + 1; }        // 九宫格设置
-int AddIndex() { return ItemCount() + 2; }           // 「＋」添加位
-int SlotCount() { return ItemCount() + 3; }
+int ClockIndex() { return s.showClock ? ItemCount() : -1; }              // 日期时间信息块
+int CenterIndex() { return s.showCenter ? ItemCount() + (s.showClock ? 1 : 0) : -1; }  // 九宫格设置
+int AddIndex() {
+    if (!s.showAdd) return -1;
+    return ItemCount() + (s.showClock ? 1 : 0) + (s.showCenter ? 1 : 0);  // 「＋」添加位
+}
+int SlotCount() { return ItemCount() + (s.showClock ? 1 : 0) + (s.showCenter ? 1 : 0) + (s.showAdd ? 1 : 0); }
 bool Vertical() { return s.edge == 2 || s.edge == 3; }
 
 int ScaledPx(float v) { return static_cast<int>(std::lround(v * g.dpiScale)); }
@@ -709,7 +831,9 @@ void LayoutMetrics(int* boxOut, int* gapOut, int* reflOut) {
     const int slots = SlotCount();
     if (g.cacheBox > 0 && g.cacheAvail == g.availLen && g.cacheIconSize == s.iconSize &&
         g.cacheSlotCount == slots && g.cacheEdge == s.edge &&
-        g.cacheReflection == s.reflection && g.cacheDpi == g.dpiScale) {
+        g.cacheReflection == s.reflection && g.cacheDpi == g.dpiScale &&
+        g.cacheShowClock == s.showClock && g.cacheShowCenter == s.showCenter &&
+        g.cacheShowAdd == s.showAdd) {
         *boxOut = g.cacheBox;
         *gapOut = g.cacheGap;
         *reflOut = g.cacheRefl;
@@ -730,7 +854,7 @@ void LayoutMetrics(int* boxOut, int* gapOut, int* reflOut) {
     auto total = [&](int box, int gap, int refl) {
         const int blk = (refl > 1) ? (refl + reflGap) : 0;
         const int along = 2 * pad + n * box + (n - 1) * gap + (vertical ? n * blk : 0) +
-                          ClockExtraFor(box);
+                          (s.showClock ? ClockExtraFor(box) : 0);
         return along + (vertical ? 0 : blk);
     };
 
@@ -777,6 +901,9 @@ void LayoutMetrics(int* boxOut, int* gapOut, int* reflOut) {
     g.cacheEdge = s.edge;
     g.cacheReflection = s.reflection;
     g.cacheDpi = g.dpiScale;
+    g.cacheShowClock = s.showClock;
+    g.cacheShowCenter = s.showCenter;
+    g.cacheShowAdd = s.showAdd;
 
     *boxOut = box;
     *gapOut = gap;
@@ -797,9 +924,10 @@ int ReflExtra() {
 // 每格沿停靠方向的步进：竖排时把倒影一起算进去，否则倒影会压到下一个图标
 int SlotStep() { return IconBox() + GapPxEff() + (Vertical() ? ReflExtra() : 0); }
 int ClockWidth() { return Vertical() ? IconBox() : ClockWidthFor(IconBox()); }
-int ClockExtra() { return ClockExtraFor(IconBox()); }
+int ClockExtra() { return s.showClock ? ClockExtraFor(IconBox()) : 0; }
 int SlotStart(int i) {
-    return AlongPad() + i * SlotStep() + (i > ClockIndex() ? ClockExtra() : 0);
+    const int clock = ClockIndex();
+    return AlongPad() + i * SlotStep() + ((clock >= 0 && i > clock) ? ClockExtra() : 0);
 }
 
 int BarLength() {
@@ -1767,6 +1895,568 @@ void HidePopup() {
     Dbg(L"popup hidden");
 }
 
+// --------------------------------------------------------------- group panel ---
+// 文件夹二级栏：沿用九宫格面板的 DComp 小交换链，但内容是目录里的启动项。
+constexpr float kGroupTileW = 88.0f;
+constexpr float kGroupTileH = 94.0f;
+constexpr float kGroupGap = 8.0f;
+constexpr float kGroupPad = 14.0f;
+constexpr float kGroupHeader = 48.0f;
+constexpr float kGroupFooter = 26.0f;
+constexpr int kGroupCols = 4;
+constexpr int kGroupMaxRows = 4;
+
+float GroupTileW() { return kGroupTileW * g.dpiScale; }
+float GroupTileH() { return kGroupTileH * g.dpiScale; }
+float GroupGap() { return kGroupGap * g.dpiScale; }
+float GroupPad() { return kGroupPad * g.dpiScale; }
+float GroupHeader() { return kGroupHeader * g.dpiScale; }
+
+int GroupRowsVisible() {
+    const int total = static_cast<int>(gGroup.paths.size());
+    const int rows = (total + kGroupCols - 1) / kGroupCols;
+    return std::max(1, std::min(rows, kGroupMaxRows));
+}
+
+int GroupWidthPx() {
+    return static_cast<int>(std::lround(GroupPad() * 2.0f + GroupTileW() * kGroupCols +
+                                        GroupGap() * (kGroupCols - 1)));
+}
+int GroupHeightPx() {
+    return static_cast<int>(std::lround(GroupPad() * 2.0f + GroupHeader() +
+                                        GroupTileH() * GroupRowsVisible() +
+                                        GroupGap() * (GroupRowsVisible() - 1) +
+                                        kGroupFooter * g.dpiScale));
+}
+
+D2D1_RECT_F GroupTileRect(int index) {
+    const int visible = index - gGroup.scrollRow * kGroupCols;
+    const int col = visible % kGroupCols;
+    const int row = visible / kGroupCols;
+    const float left = GroupPad() + col * (GroupTileW() + GroupGap());
+    const float top = GroupPad() + GroupHeader() + row * (GroupTileH() + GroupGap());
+    return D2D1::RectF(left, top, left + GroupTileW(), top + GroupTileH());
+}
+
+int GroupHitTest(int x, int y) {
+    const int rows = GroupRowsVisible();
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < kGroupCols; ++c) {
+            const int index = (gGroup.scrollRow + r) * kGroupCols + c;
+            if (index >= static_cast<int>(gGroup.paths.size())) return -1;
+            const D2D1_RECT_F tile = GroupTileRect(index);
+            if (x >= tile.left && x < tile.right && y >= tile.top && y < tile.bottom) return index;
+        }
+    }
+    return -1;
+}
+
+bool ResolveShortcutTarget(const std::wstring& lnk, std::wstring* target) {
+    ComPtr<IShellLinkW> link;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&link)))) {
+        return false;
+    }
+    ComPtr<IPersistFile> file;
+    if (FAILED(link.As(&file))) return false;
+    if (FAILED(file->Load(lnk.c_str(), STGM_READ))) return false;
+    wchar_t buf[MAX_PATH * 2]{};
+    if (FAILED(link->GetPath(buf, ARRAYSIZE(buf), nullptr, SLGP_RAWPATH))) return false;
+    if (!buf[0]) return false;
+    *target = buf;
+    return true;
+}
+
+// 目录 → 二级栏根目录；.lnk 指向目录时也当作文件夹。
+bool ResolveGroupRoot(const std::wstring& path, std::wstring* root) {
+    if (IsDirectoryPath(path)) {
+        *root = path;
+        return true;
+    }
+    if (_wcsicmp(FileNameOf(path).c_str(), L"") != 0 && IsLaunchableFile(path)) {
+        std::wstring target;
+        if (ResolveShortcutTarget(path, &target) && IsDirectoryPath(target)) {
+            *root = target;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsDockItemGroup(int index) {
+    if (index < 0 || index >= ItemCount()) return false;
+    const std::wstring& path = g.items[static_cast<size_t>(index)];
+    if (IsDirectoryPath(path)) return true;
+    std::wstring target;
+    return ResolveShortcutTarget(path, &target) && IsDirectoryPath(target);
+}
+
+std::wstring StripTrailingSlash(std::wstring path) {
+    while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/')) path.pop_back();
+    return path;
+}
+
+void LoadGroupEntries() {
+    gGroup.paths.clear();
+    gGroup.isDir.clear();
+    gGroup.icons.clear();
+    gGroup.hover = -1;
+    gGroup.scrollRow = 0;
+
+    const std::wstring pattern = StripTrailingSlash(gGroup.root) + L"\\*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+
+    struct Entry { std::wstring name; std::wstring path; bool dir; };
+    std::vector<Entry> entries;
+    do {
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == 0 ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) continue;
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+        const bool dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const std::wstring name = fd.cFileName;
+        if (!dir && !IsLaunchableFile(name)) continue;
+        entries.push_back({ name, StripTrailingSlash(gGroup.root) + L"\\" + name, dir });
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+
+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.dir != b.dir) return a.dir;                  // 文件夹在前
+        return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+
+    const UINT px = static_cast<UINT>(std::lround(64.0f * g.dpiScale));
+    for (const auto& e : entries) {
+        gGroup.paths.push_back(e.path);
+        gGroup.isDir.push_back(e.dir);
+        gGroup.icons.push_back(e.dir ? nullptr : WicToD2DBitmap(LoadIconWic(e.path, px).Get()));
+    }
+}
+
+void EnsureGroupFormats() {
+    if (!g.dwrite) return;
+    if (gGroup.formatDpi == g.dpiScale && gGroup.titleFmt) return;
+    gGroup.formatDpi = g.dpiScale;
+    gGroup.titleFmt.Reset();
+    gGroup.labelFmt.Reset();
+    gGroup.captionFmt.Reset();
+
+    g.dwrite->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                               DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                               13.0f * g.dpiScale, L"zh-CN", &gGroup.titleFmt);
+    if (gGroup.titleFmt) {
+        gGroup.titleFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        gGroup.titleFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        gGroup.titleFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    g.dwrite->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                               DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                               10.0f * g.dpiScale, L"zh-CN", &gGroup.labelFmt);
+    if (gGroup.labelFmt) {
+        gGroup.labelFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        gGroup.labelFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        gGroup.labelFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    g.dwrite->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                               DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                               9.0f * g.dpiScale, L"zh-CN", &gGroup.captionFmt);
+    if (gGroup.captionFmt) {
+        gGroup.captionFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        gGroup.captionFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        gGroup.captionFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+}
+
+void EnsureGroupWindow() {
+    if (gGroup.hwnd) return;
+    static bool classOnce = false;
+    if (!classOnce) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = GroupProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"DockGroupWindow";
+        RegisterClassExW(&wc);
+        classOnce = true;
+    }
+    gGroup.hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+        L"DockGroupWindow", L"Dock 文件夹", WS_POPUP, 0, 0, GroupWidthPx(), GroupHeightPx(),
+        g.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!gGroup.hwnd) return;
+    if (!g.compDevice) return;
+    if (FAILED(g.compDevice->CreateTargetForHwnd(gGroup.hwnd, TRUE, &gGroup.target))) return;
+    if (FAILED(g.compDevice->CreateVisual(&gGroup.visual))) return;
+    if (FAILED(gGroup.target->SetRoot(gGroup.visual.Get()))) return;
+
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = static_cast<UINT>(GroupWidthPx());
+    desc.Height = static_cast<UINT>(GroupHeightPx());
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<IDXGIFactory2> factory;
+    if (FAILED(g.d3d.As(&dxgiDevice))) return;
+    if (FAILED(dxgiDevice->GetAdapter(&adapter))) return;
+    if (FAILED(adapter->GetParent(__uuidof(IDXGIFactory2),
+                                  reinterpret_cast<void**>(factory.GetAddressOf())))) return;
+    if (FAILED(factory->CreateSwapChainForComposition(g.d3d.Get(), &desc, nullptr, &gGroup.swap)))
+        return;
+    if (FAILED(gGroup.visual->SetContent(gGroup.swap.Get()))) return;
+    g.compDevice->Commit();
+    gGroup.w = desc.Width;
+    gGroup.h = desc.Height;
+}
+
+void ResizeGroupTarget() {
+    if (!gGroup.swap || !g.dc) return;
+    const UINT w = static_cast<UINT>(GroupWidthPx());
+    const UINT h = static_cast<UINT>(GroupHeightPx());
+    if (w == gGroup.w && h == gGroup.h && gGroup.bitmap) return;
+
+    g.dc->SetTarget(nullptr);
+    g.dc->Flush();
+    gGroup.bitmap.Reset();
+    if (FAILED(gGroup.swap->ResizeBuffers(2, w, h, DXGI_FORMAT_UNKNOWN, 0))) return;
+    ComPtr<IDXGISurface> surface;
+    if (FAILED(gGroup.swap->GetBuffer(0, __uuidof(IDXGISurface),
+                                      reinterpret_cast<void**>(surface.GetAddressOf())))) return;
+    const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+    if (FAILED(g.dc->CreateBitmapFromDxgiSurface(surface.Get(), &props, &gGroup.bitmap))) return;
+    gGroup.w = w;
+    gGroup.h = h;
+    if (g.compDevice) g.compDevice->Commit();
+}
+
+void PositionGroup() {
+    if (!gGroup.hwnd || !g.hwnd) return;
+    RECT dock{};
+    if (!GetWindowRect(g.hwnd, &dock)) return;
+    const RECT area = DockArea();
+    const int w = GroupWidthPx();
+    const int h = GroupHeightPx();
+    const int gap = ScaledPx(10.0f);
+    int x = dock.left + (dock.right - dock.left - w) / 2;
+    int y = dock.top - h - gap;
+    switch (s.edge) {
+    case 1: y = dock.bottom + gap; break;
+    case 2: x = dock.right + gap; y = dock.top + (dock.bottom - dock.top - h) / 2; break;
+    case 3: x = dock.left - w - gap; y = dock.top + (dock.bottom - dock.top - h) / 2; break;
+    default: break;
+    }
+    if (x < area.left + 4) x = area.left + 4;
+    if (x + w > area.right - 4) x = area.right - 4 - w;
+    if (y < area.top + 4) y = area.top + 4;
+    if (y + h > area.bottom - 4) y = area.bottom - 4 - h;
+    SetWindowPos(gGroup.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+}
+
+LRESULT CALLBACK GroupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        const int hover = GroupHitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (hover != gGroup.hover) {
+            gGroup.hover = hover;
+            RenderGroup();
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (gGroup.hover != -1) {
+            gGroup.hover = -1;
+            RenderGroup();
+        }
+        return 0;
+    case WM_LBUTTONUP: {
+        const int x = GET_X_LPARAM(lp);
+        const int y = GET_Y_LPARAM(lp);
+        if (!gGroup.parents.empty()) {
+            const float headH = GroupPad() + GroupHeader();
+            if (y < headH && x < GroupPad() + 28.0f * g.dpiScale) {
+                GroupGoBack();
+                return 0;
+            }
+        }
+        const int index = GroupHitTest(x, y);
+        if (index >= 0) GroupActivate(index);
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+        GroupScroll(GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) HideGroup();
+        return 0;
+    case WM_DESTROY:
+        gGroup.hwnd = nullptr;
+        gGroup.shown = false;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void RenderGroup() {
+    if (!gGroup.hwnd || !gGroup.bitmap || !g.dc) return;
+    EnsureGroupFormats();
+    g.dc->SetTarget(gGroup.bitmap.Get());
+    g.dc->BeginDraw();
+    g.dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+    if (!g.brush) {
+        if (FAILED(g.dc->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), &g.brush))) {
+            g.dc->EndDraw();
+            return;
+        }
+    }
+
+    const float w = static_cast<float>(gGroup.w);
+    const float h = static_cast<float>(gGroup.h);
+    const float r = 18.0f * g.dpiScale;
+    const D2D1_ROUNDED_RECT panel{ D2D1::RectF(0.5f, 0.5f, w - 0.5f, h - 0.5f), r, r };
+
+    // 二级栏跟随主 Dock 的外观，避免"主栏浅白毛玻璃、弹出层却是深色块"
+    D2D1_COLOR_F fill{}, line{};
+    float ink = 1.0f;
+    switch (s.material) {
+    case 0:
+        // 面板是普通分层窗口，没有 DWM 模糊可用，所以用较高不透明度的浅白，
+        // 视觉上与主栏的浅白毛玻璃保持一致，又不会糊成一片。
+        fill = D2D1::ColorF(0.96f, 0.97f, 0.99f, 0.88f);
+        line = D2D1::ColorF(0, 0, 0, 0.06f);
+        ink = 0.15f;
+        break;
+    case 1:
+        fill = D2D1::ColorF(0.08f, 0.09f, 0.13f, 0.55f);
+        line = D2D1::ColorF(1, 1, 1, 0.10f);
+        ink = 1.0f;
+        break;
+    case 2:
+        fill = D2D1::ColorF(0.045f, 0.050f, 0.065f, 0.95f);
+        line = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f);
+        ink = 1.0f;
+        break;
+    default:
+        fill = D2D1::ColorF(0.93f, 0.94f, 0.96f, 0.96f);
+        line = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f);
+        ink = 0.15f;
+        break;
+    }
+
+    g.brush->SetColor(fill);
+    g.dc->FillRoundedRectangle(panel, g.brush.Get());
+    if (line.a > 0.0f) {
+        g.brush->SetColor(line);
+        g.dc->DrawRoundedRectangle(panel, g.brush.Get(), 1.0f);
+    }
+
+    // 顶栏：返回箭头 + 标题
+    const float headY = GroupPad() + GroupHeader() * 0.5f;
+    if (!gGroup.parents.empty()) {
+        const float aw = 6.0f * g.dpiScale;
+        const float ax = GroupPad() + 8.0f * g.dpiScale;
+        g.brush->SetColor(D2D1::ColorF(ink, ink, ink, 0.92f));
+        g.dc->DrawLine(D2D1::Point2F(ax + aw, headY - aw), D2D1::Point2F(ax, headY),
+                       g.brush.Get(), 1.6f * g.dpiScale);
+        g.dc->DrawLine(D2D1::Point2F(ax, headY), D2D1::Point2F(ax + aw, headY + aw),
+                       g.brush.Get(), 1.6f * g.dpiScale);
+    }
+
+    std::wstring title = gGroup.title;
+    if (title.size() > 20) title = title.substr(0, 19) + L"…";
+    const float titleLeft = (gGroup.parents.empty()) ? GroupPad()
+                                                     : GroupPad() + 26.0f * g.dpiScale;
+    const D2D1_RECT_F titleRect{ titleLeft, GroupPad() + 4.0f * g.dpiScale,
+                                 w - GroupPad(), GroupPad() + GroupHeader() - 4.0f * g.dpiScale };
+    if (gGroup.titleFmt) {
+        g.brush->SetColor(D2D1::ColorF(ink, ink, ink, 0.97f));
+        g.dc->DrawTextW(title.c_str(), static_cast<UINT32>(title.size()),
+                        gGroup.titleFmt.Get(), titleRect, g.brush.Get());
+    }
+
+    const int count = static_cast<int>(gGroup.paths.size());
+    for (int i = 0; i < count; ++i) {
+        const D2D1_RECT_F tile = GroupTileRect(i);
+        if (tile.top >= h - kGroupFooter * g.dpiScale) break;
+        const bool hot = (i == gGroup.hover);
+        if (hot) {
+            g.brush->SetColor(D2D1::ColorF(ink, ink, ink, 0.14f));
+            g.dc->FillRoundedRectangle(D2D1::RoundedRect(
+                D2D1::RectF(tile.left - 2.0f, tile.top - 2.0f,
+                            tile.right + 2.0f, tile.bottom + 2.0f),
+                10.0f * g.dpiScale, 10.0f * g.dpiScale), g.brush.Get());
+        }
+        const float iconSize = 46.0f * g.dpiScale;
+        const float iconLeft = (tile.left + tile.right) * 0.5f - iconSize * 0.5f;
+        const float iconTop = tile.top + 8.0f * g.dpiScale;
+        const D2D1_RECT_F iconRect{ iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize };
+
+        if (i < static_cast<int>(gGroup.isDir.size()) && gGroup.isDir[static_cast<size_t>(i)]) {
+            DrawFolderGlyph(g.dc.Get(), g.brush.Get(), iconRect, 1.0f);
+        } else if (i < static_cast<int>(gGroup.icons.size()) && gGroup.icons[static_cast<size_t>(i)]) {
+            g.dc->DrawBitmap(gGroup.icons[static_cast<size_t>(i)].Get(), iconRect, 1.0f,
+                             D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR, nullptr, nullptr);
+        } else {
+            g.brush->SetColor(HashColor(gGroup.paths[static_cast<size_t>(i)]));
+            g.dc->FillRoundedRectangle(D2D1::RoundedRect(iconRect, 9.0f * g.dpiScale,
+                                                         9.0f * g.dpiScale), g.brush.Get());
+        }
+
+        std::wstring name = FileNameOf(gGroup.paths[static_cast<size_t>(i)]);
+        if (name.size() > 9) name = name.substr(0, 8) + L"…";
+        const D2D1_RECT_F nameRect{ tile.left, iconTop + iconSize + 6.0f * g.dpiScale,
+                                    tile.right, tile.bottom - 2.0f * g.dpiScale };
+        if (gGroup.labelFmt) {
+            g.brush->SetColor(D2D1::ColorF(ink, ink, ink, hot ? 1.0f : 0.86f));
+            g.dc->DrawTextW(name.c_str(), static_cast<UINT32>(name.size()),
+                            gGroup.labelFmt.Get(), nameRect, g.brush.Get());
+        }
+    }
+
+    if (count == 0) {
+        const D2D1_RECT_F empty{ GroupPad(), GroupPad() + GroupHeader(),
+                                 w - GroupPad(), h - kGroupFooter * g.dpiScale };
+        if (gGroup.labelFmt) {
+            g.brush->SetColor(D2D1::ColorF(ink, ink, ink, 0.62f));
+            g.dc->DrawTextW(L"这个文件夹里没有可启动的程序", 14, gGroup.labelFmt.Get(),
+                            empty, g.brush.Get());
+        }
+    }
+
+    // 底栏：条目数 / 滚动提示
+    wchar_t footer[96]{};
+    const int rowsTotal = (count + kGroupCols - 1) / kGroupCols;
+    if (rowsTotal > kGroupMaxRows) {
+        swprintf_s(footer, L"%d 个项目 · 滚轮翻页 %d/%d", count,
+                   gGroup.scrollRow + 1, std::max(1, rowsTotal - kGroupMaxRows + 1));
+    } else {
+        swprintf_s(footer, L"%d 个项目", count);
+    }
+    if (gGroup.captionFmt) {
+        g.brush->SetColor(D2D1::ColorF(ink, ink, ink, 0.55f));
+        const D2D1_RECT_F fr{ GroupPad(), h - kGroupFooter * g.dpiScale - GroupPad() * 0.6f,
+                              w - GroupPad(), h - GroupPad() * 0.3f };
+        g.dc->DrawTextW(footer, static_cast<UINT32>(wcslen(footer)), gGroup.captionFmt.Get(),
+                        fr, g.brush.Get());
+    }
+
+    if (FAILED(g.dc->EndDraw())) {
+        g.dc->SetTarget(nullptr);
+        return;
+    }
+    gGroup.swap->Present(1, 0);
+}
+
+void HideGroup() {
+    if (!gGroup.shown && !gGroup.hwnd) return;
+    gGroup.shown = false;
+    gGroup.hover = -1;
+    gGroup.prevMouseDown = false;
+    gGroup.prevEscapeDown = false;
+    if (gGroup.watchOn) {
+        gGroup.watchOn = false;
+        KillTimer(g.hwnd, kGroupWatchTimerId);
+    }
+    if (gGroup.hwnd) ShowWindow(gGroup.hwnd, SW_HIDE);
+}
+
+void OpenGroup(const std::wstring& root, const std::wstring& title, bool pushParent) {
+    if (!g.hwnd) return;
+    if (pushParent && !gGroup.root.empty() && gGroup.root != root) {
+        gGroup.parents.push_back(gGroup.root);
+    }
+    gGroup.root = StripTrailingSlash(root);
+    gGroup.title = title.empty() ? FileNameOf(root) : title;
+    LoadGroupEntries();
+
+    EnsureGroupWindow();
+    if (!gGroup.hwnd) return;
+    ResizeGroupTarget();
+    if (!gGroup.bitmap) return;
+    gGroup.shown = true;
+    gGroup.hover = -1;
+    gGroup.prevMouseDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    gGroup.prevEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    PositionGroup();
+    RenderGroup();
+    ShowWindow(gGroup.hwnd, SW_SHOWNOACTIVATE);
+
+    if (!gGroup.watchOn) {
+        gGroup.watchOn = true;
+        SetTimer(g.hwnd, kGroupWatchTimerId, kPopupWatchMs, nullptr);
+    }
+    Dbg(L"group open: %s (%zu items)", gGroup.root.c_str(), gGroup.paths.size());
+}
+
+void OpenGroupAtItem(int index) {
+    if (index < 0 || index >= ItemCount()) return;
+    std::wstring root;
+    if (!ResolveGroupRoot(g.items[static_cast<size_t>(index)], &root)) return;
+    HidePopup();
+    gGroup.parents.clear();
+    OpenGroup(root, FileNameOf(g.items[static_cast<size_t>(index)]), false);
+}
+
+void GroupActivate(int index) {
+    if (index < 0 || index >= static_cast<int>(gGroup.paths.size())) return;
+    const std::wstring path = gGroup.paths[static_cast<size_t>(index)];
+    if (index < static_cast<int>(gGroup.isDir.size()) && gGroup.isDir[static_cast<size_t>(index)]) {
+        OpenGroup(path, FileNameOf(path), true);
+        return;
+    }
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"open";
+    sei.lpFile = path.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        MessageBoxW(gGroup.hwnd, path.c_str(), L"无法启动该条目", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    HideGroup();
+}
+
+void GroupGoBack() {
+    if (gGroup.parents.empty()) {
+        HideGroup();
+        return;
+    }
+    const std::wstring prev = gGroup.parents.back();
+    gGroup.parents.pop_back();
+    // 返回时不再压栈
+    gGroup.root = StripTrailingSlash(prev);
+    gGroup.title = FileNameOf(prev);
+    LoadGroupEntries();
+    ResizeGroupTarget();
+    PositionGroup();
+    RenderGroup();
+}
+
+void GroupScroll(int delta) {
+    const int count = static_cast<int>(gGroup.paths.size());
+    const int rowsTotal = (count + kGroupCols - 1) / kGroupCols;
+    const int maxRow = std::max(0, rowsTotal - kGroupMaxRows);
+    int row = gGroup.scrollRow + (delta > 0 ? -1 : 1);
+    row = std::max(0, std::min(maxRow, row));
+    if (row == gGroup.scrollRow) return;
+    gGroup.scrollRow = row;
+    gGroup.hover = -1;
+    RenderGroup();
+}
+
 void OpenSystemTray() {
     // 目标是任务栏右侧「显示隐藏的图标」面板（后台运行的应用），不是通知中心。
     // 先用 UI 自动化按名字找到系统托盘按钮并 Invoke；不依赖屏幕坐标与语言之外的布局。
@@ -1902,6 +2592,7 @@ void TogglePopup() {
         HidePopup();
         return;
     }
+    HideGroup();
     EnsurePopupWindow();
     if (!gPopup.hwnd) return;
     ResizePopupTarget();
@@ -2156,6 +2847,7 @@ bool StepAnimation() {
         ShowWindow(g.hwnd, SW_HIDE);
         HideLabel();
         HidePopup();
+        HideGroup();
         StopAnimTimer();
         return false;
     }
@@ -2246,6 +2938,30 @@ void AddViaDialog() {
 
     if (!GetOpenFileNameW(&ofn)) return;
     AddPath(file);
+    SaveItems();
+    RefreshAfterItemChange();
+}
+
+void AddFolderViaDialog() {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dlg)))) {
+        return;
+    }
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dlg->SetTitle(L"选择要加入 Dock 的文件夹");
+    if (FAILED(dlg->Show(g.hwnd))) return;
+
+    ComPtr<IShellItem> item;
+    if (FAILED(dlg->GetResult(&item))) return;
+    PWSTR path = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) || !path) return;
+    const std::wstring folder = path;
+    CoTaskMemFree(path);
+
+    AddPath(folder);
     SaveItems();
     RefreshAfterItemChange();
 }
@@ -2356,6 +3072,7 @@ void ApplyFullscreenState(bool fs) {
         g.hover = -1;
         HideLabel();
         HidePopup();
+        HideGroup();
         StopAnimTimer();
         ShowWindow(g.hwnd, SW_HIDE);
         Dbg(L"fullscreen on: dock hidden");
@@ -2450,18 +3167,46 @@ bool AnyWindowOverDock() {
     return false;
 }
 
-// 鼠标是否靠近 Dock 所在区域（收起后用来判断"该浮出来了"）——
-// 这是"自动回正"失败时的备用方式：即使仍有窗口遮挡，靠近边缘也能临时唤出。
-bool CursorNearDock() {
+// 收起后的唤出热区：只有贴着屏幕边缘、且落在 Dock 长度范围内的窄条才算。
+//
+// 之前用的是 Dock 矩形四周 24px 的"扩边"，结果鼠标在浏览器/游戏里划到底部、
+// 想点页面上的按钮时就会误唤起 Dock。现在改成：
+//   · 只在 Dock 朝向的那条屏幕边缘；
+//   · 厚度仅 4px（真正"撞到屏幕边"）；
+//   · 还需停留 ~190ms，快速划过不会触发。
+bool CursorAtHotEdge() {
     POINT p{};
     if (!GetCursorPos(&p)) return false;
     const RECT d = g.baseRect;
     if (d.right <= d.left || d.bottom <= d.top) return false;
-    const RECT pad{ d.left - kRevealPad, d.top - kRevealPad,
-                    d.right + kRevealPad, d.bottom + kRevealPad };
-    if (p.x < pad.left || p.x >= pad.right || p.y < pad.top || p.y >= pad.bottom) return false;
-    return MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) ==
-           MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST);
+    if (MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) !=
+        MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST)) {
+        return false;
+    }
+
+    const RECT area = DockArea();
+    switch (s.edge) {
+    // 只有真正顶到屏幕边缘才算（1px）。窗口内部"靠近底部"永远不算，
+    // 这样浏览器 / 游戏里点页面下方按钮时不会被抢走。
+    case 0:  // 底部：贴屏幕最下方
+        return p.y >= area.bottom - kHotEdgePx &&
+               p.x >= d.left && p.x < d.right;
+    case 1:  // 顶部
+        return p.y <= area.top + kHotEdgePx &&
+               p.x >= d.left && p.x < d.right;
+    case 2:  // 左侧
+        return p.x <= area.left + kHotEdgePx &&
+               p.y >= d.top && p.y < d.bottom;
+    default: // 右侧
+        return p.x >= area.right - kHotEdgePx &&
+               p.y >= d.top && p.y < d.bottom;
+    }
+}
+
+// 光标是否顶到边缘后保持不动。"划过去"和"停在页面底部"都不会触发。
+bool CursorHeldStill(const POINT& p) {
+    return std::abs(p.x - g.edgeAnchorPt.x) <= kRevealStillPx &&
+           std::abs(p.y - g.edgeAnchorPt.y) <= kRevealStillPx;
 }
 
 bool CursorInsideDock() {
@@ -2472,14 +3217,62 @@ bool CursorInsideDock() {
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 }
 
+bool CursorInsidePanel() {
+    POINT p{};
+    if (!GetCursorPos(&p)) return false;
+    auto inside = [&](HWND h) {
+        if (!h || !IsWindowVisible(h)) return false;
+        RECT r{};
+        if (!GetWindowRect(h, &r)) return false;
+        return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+    };
+    return inside(gPopup.hwnd) || inside(gGroup.hwnd);
+}
+
+void StartRevealWatch() {
+    if (!g.hwnd || g.revealTimerOn) return;
+    if (!s.edgeReveal) return;   // 关掉"贴边唤出"后完全不起定时器，零额外唤醒
+    g.revealTimerOn = true;
+    g.edgeArmed = false;
+    g.edgeEnterTick = 0;
+    g.revealLeaveTick = 0;
+    g.edgeAnchorPt = {};
+    SetTimer(g.hwnd, kRevealTimerId, kRevealPollMs, nullptr);
+}
+
+void StopRevealWatch() {
+    if (!g.revealTimerOn) return;
+    g.revealTimerOn = false;
+    g.edgeArmed = false;
+    g.edgeEnterTick = 0;
+    KillTimer(g.hwnd, kRevealTimerId);
+}
+
+void SetSmartTimerInterval(UINT intervalMs) {
+    if (g.smartTimerOn) SetTimer(g.hwnd, kSmartTimerId, intervalMs, nullptr);
+}
+
+void RefreshRevealDeadline() {
+    if (g.hoverRevealed) g.revealHideAt = GetTickCount() + kManualRevealMs;
+}
+
+void ClearRevealDeadline() {
+    g.revealHideAt = 0;
+    SetSmartTimerInterval(kSmartPollMs);
+}
+
 void SetAutoHidden(bool hide) {
     if (hide == g.autoHidden) return;
     g.autoHidden = hide;
 
     if (hide) {
+        g.hoverRevealed = false;
+        ClearRevealDeadline();
         g.hover = -1;
         HideLabel();
         HidePopup();
+        HideGroup();
+        StartRevealWatch();
         g.opacityTarget = 0.0f;     // 先淡出，滑出到位后由动画 SW_HIDE
     } else {
         if (!g.winShown) {          // 从完全隐藏状态回来：先显示窗口再滑入
@@ -2489,46 +3282,114 @@ void SetAutoHidden(bool hide) {
         g.slide = 1.0f;             // 从屏幕外开始滑入
         g.opacity = 0.0f;
         g.opacityTarget = 1.0f;
+        StopRevealWatch();
         PositionDock();
+        if (g.hoverRevealed) {
+            RefreshRevealDeadline();
+            SetSmartTimerInterval(kSmartRevealPollMs);
+        }
     }
     StartAnimTimer();
     Dbg(L"smart hide=%d", hide ? 1 : 0);
 }
 
-// 每秒 2.5 次（400ms）轮询：
-//   1) 遮挡判定 —— 无窗口遮挡时自动回正，有遮挡时收起；
-//   2) 收起期间若鼠标靠近 Dock 区域，临时浮出（备用唤出方式）。
+// 700ms 轮询只负责"是否被遮挡 → 自动回正"。
+// 边缘唤出改成独立的 80ms 热区检测（kRevealTimerId），两者互不拖累。
 void UpdateSmartHide() {
     if (!g.hwnd || g.hidden || g.fsHidden) return;
-
-    const bool blocked = s.smartHide ? AnyWindowOverDock() : false;
+    if (g.menuOpen) return;
 
     if (g.autoHidden) {
         // ① 自动回正：遮挡消失了就回来
+        const bool blocked = s.smartHide && AnyWindowOverDock();
         if (!blocked) {
             g.hoverRevealed = false;
             SetAutoHidden(false);
             return;
         }
-        // ② 备用回正：仍有遮挡，但鼠标靠近 Dock 区域 → 临时浮出
-        if (CursorNearDock() || CursorInsideDock()) {
+        // ② 鼠标停在边缘热区 → 由 UpdateReveal 负责临时浮出
+        return;
+    }
+
+    // 临时浮出后：鼠标在 Dock / 面板内则续期；离开满 3 秒才重新收起。
+    if (g.hoverRevealed) {
+        const DWORD now = GetTickCount();
+        if (CursorInsideDock() || CursorInsidePanel()) {
+            g.revealHideAt = now + kManualRevealMs;
+            return;
+        }
+        if (g.revealHideAt && now < g.revealHideAt) return;
+        g.hoverRevealed = false;
+        ClearRevealDeadline();
+        if (s.smartHide && AnyWindowOverDock()) SetAutoHidden(true);
+        return;
+    }
+
+    if (s.smartHide && AnyWindowOverDock()) SetAutoHidden(true);
+}
+
+// 边缘唤出：100ms 采样，鼠标必须"顶到屏幕边缘 + 基本不动"满 kRevealDwellMs 才浮出；
+// 只要在停留过程中移动超过 3px 就重新计时，所以快速划向下方按钮不会误触。
+void UpdateReveal() {
+    if (!g.hwnd || g.hidden || g.fsHidden) return;
+    if (!g.autoHidden && !g.hoverRevealed) {
+        StopRevealWatch();
+        return;
+    }
+    if (!s.edgeReveal) {
+        StopRevealWatch();
+        return;
+    }
+
+    POINT p{};
+    GetCursorPos(&p);
+    const bool onEdge = CursorAtHotEdge();
+    const DWORD now = GetTickCount();
+    const bool cooling = g.revealCooldownUntil && now < g.revealCooldownUntil;
+
+    // 顶到边缘还在点击（例如最大化窗口里点最下方的按钮）：判定为"要用下面的应用"，
+    // 立刻进入冷却，不抢这次点击。
+    if (onEdge && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+        g.revealCooldownUntil = now + kRevealCooldownMs;
+        g.edgeArmed = false;
+        g.edgeEnterTick = 0;
+        return;
+    }
+
+    if (onEdge && !cooling) {
+        g.revealLeaveTick = 0;
+        if (!g.edgeArmed) {
+            g.edgeArmed = true;
+            g.edgeEnterTick = now;
+            g.edgeAnchorPt = p;
+        } else if (!CursorHeldStill(p)) {
+            // 在边缘上还在滑动：重新计时，不唤出
+            g.edgeAnchorPt = p;
+            g.edgeEnterTick = now;
+        } else if (now - g.edgeEnterTick >= kRevealDwellMs) {
             if (!g.hoverRevealed) {
                 g.hoverRevealed = true;
                 SetAutoHidden(false);
+                RefreshRevealDeadline();
+                SetSmartTimerInterval(kSmartRevealPollMs);
             }
         }
         return;
     }
 
-    // 临时浮出后：鼠标离开 Dock 区域且仍被遮挡 → 重新收起
-    if (g.hoverRevealed) {
-        if (CursorInsideDock() || CursorNearDock()) return;
-        g.hoverRevealed = false;
-        if (blocked) SetAutoHidden(true);
+    g.edgeArmed = false;
+    g.edgeEnterTick = 0;
+    if (CursorInsideDock() || CursorInsidePanel()) {
+        g.revealLeaveTick = 0;
         return;
     }
-
-    if (blocked) SetAutoHidden(true);
+    if (g.revealLeaveTick == 0) g.revealLeaveTick = now;
+    if (g.revealLeaveTick && now - g.revealLeaveTick >= kRevealLeaveMs) {
+        if (g.autoHidden) return;   // 已收起，等下一个边缘停留
+        g.revealLeaveTick = 0;
+        if (g.hoverRevealed) return;   // 交给 3 秒无操作计时器
+        if (s.smartHide && AnyWindowOverDock()) SetAutoHidden(true);
+    }
 }
 void StartSmartWatch() {
     if (!g.hwnd || g.smartTimerOn) return;
@@ -2541,8 +3402,10 @@ void StopSmartWatch() {
         g.smartTimerOn = false;
         KillTimer(g.hwnd, kSmartTimerId);
     }
+    g.revealHideAt = 0;
     if (g.autoHidden) SetAutoHidden(false);
     g.hoverRevealed = false;
+    StopRevealWatch();
 }
 void StopFullscreenWatch() {
     if (g.fsHook) {
@@ -2563,6 +3426,8 @@ void ToggleVisibility() {
     if (g.autoHidden) {         // 被遮挡自动收起中：点托盘 = 唤出（并临时保持）
         g.hoverRevealed = true;
         SetAutoHidden(false);
+        RefreshRevealDeadline();
+        SetSmartTimerInterval(kSmartRevealPollMs);
         return;
     }
     if (g.fsHidden) {           // 全屏中被自动隐藏：手动唤出，本次全屏内不再自动隐藏
@@ -2574,6 +3439,7 @@ void ToggleVisibility() {
     if (g.hidden) {
         HideLabel();
         HidePopup();
+        HideGroup();
     }
     if (g.hidden) {
         ShowWindow(g.hwnd, SW_HIDE);
@@ -2698,6 +3564,13 @@ HMENU BuildMenu(int itemIndex) {
     AppendMenuW(menu, MF_STRING | (g.taskbarHidden ? MF_CHECKED : 0), kCmdTaskbar, L"隐藏系统任务栏");
     AppendMenuW(menu, MF_STRING | (s.hideFullscreen ? MF_CHECKED : 0), kCmdHideFullscreen, L"全屏应用时自动隐藏");
     AppendMenuW(menu, MF_STRING | (s.smartHide ? MF_CHECKED : 0), kCmdSmartHide, L"被窗口挡住时自动收起");
+    AppendMenuW(menu, MF_STRING | (s.edgeReveal ? MF_CHECKED : 0), kCmdEdgeReveal, L"贴边唤出（需停稳）");
+
+    HMENU modules = CreatePopupMenu();
+    AppendMenuW(modules, MF_STRING | (s.showClock ? MF_CHECKED : 0), kCmdShowClock, L"日期时间");
+    AppendMenuW(modules, MF_STRING | (s.showCenter ? MF_CHECKED : 0), kCmdShowCenter, L"九宫格设置");
+    AppendMenuW(modules, MF_STRING | (s.showAdd ? MF_CHECKED : 0), kCmdShowAdd, L"「＋」添加按钮");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(modules), L"内置图标");
 
     AppendMenuW(menu, MF_STRING | (s.autoStart ? MF_CHECKED : 0), kCmdAutoStart, L"开机自启");
     AppendMenuW(menu, MF_STRING, kCmdOpenTray, L"打开系统托盘");
@@ -2708,6 +3581,7 @@ HMENU BuildMenu(int itemIndex) {
         AppendMenuW(menu, MF_STRING, kCmdRemoveBase + itemIndex, label.c_str());
     }
     AppendMenuW(menu, MF_STRING, kCmdAdd, L"添加应用…");
+    AppendMenuW(menu, MF_STRING, kCmdAddFolder, L"添加文件夹…");
     AppendMenuW(menu, MF_STRING, kCmdRefreshIcons, L"刷新图标");
     AppendMenuW(menu, MF_STRING, kCmdOpenFolder, L"打开程序所在文件夹");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2733,6 +3607,7 @@ void HandleCommand(int cmd) {
         UpdateWindowGeometry();
         Render();
         if (gPopup.shown) { PositionPopup(); RenderPopup(); }
+        if (gGroup.shown) { PositionGroup(); RenderGroup(); }
         break;
     case kCmdMatAcrylic:
     case kCmdMatTransparent:
@@ -2743,6 +3618,7 @@ void HandleCommand(int cmd) {
         ApplyMaterial();
         Render();
         RefreshPopupIfShown();
+        if (gGroup.shown) RenderGroup();
         break;
     case kCmdSizeSmall:
     case kCmdSizeMedium:
@@ -2752,6 +3628,7 @@ void HandleCommand(int cmd) {
         SaveSettings();
         RefreshAfterItemChange();
         RefreshPopupIfShown();
+        if (gGroup.shown) { ResizeGroupTarget(); PositionGroup(); RenderGroup(); }
         break;
     case kCmdAutoStart:
         s.autoStart = !s.autoStart;
@@ -2774,10 +3651,19 @@ void HandleCommand(int cmd) {
         s.smartHide = !s.smartHide;
         SaveSettings();
         g.hoverRevealed = false;
+        ClearRevealDeadline();
         if (!s.smartHide) SetAutoHidden(false);
         else UpdateSmartHide();
         RefreshPopupIfShown();
         Render();
+        break;
+    case kCmdEdgeReveal:
+        s.edgeReveal = !s.edgeReveal;
+        SaveSettings();
+        g.revealCooldownUntil = 0;
+        if (!s.edgeReveal) StopRevealWatch();
+        else if (g.autoHidden) StartRevealWatch();
+        RefreshPopupIfShown();
         break;
     case kCmdHideFullscreen:
         s.hideFullscreen = !s.hideFullscreen;
@@ -2792,6 +3678,31 @@ void HandleCommand(int cmd) {
         Render();
         break;
     case kCmdAdd: AddViaDialog(); break;
+    case kCmdAddFolder: AddFolderViaDialog(); break;
+    case kCmdShowClock:
+        s.showClock = !s.showClock;
+        SaveSettings();
+        g.cacheBox = -1;
+        RefreshAfterItemChange();
+        if (gGroup.shown) { PositionGroup(); RenderGroup(); }
+        RefreshPopupIfShown();
+        break;
+    case kCmdShowCenter:
+        s.showCenter = !s.showCenter;
+        SaveSettings();
+        g.cacheBox = -1;
+        RefreshAfterItemChange();
+        if (gGroup.shown) { PositionGroup(); RenderGroup(); }
+        RefreshPopupIfShown();
+        break;
+    case kCmdShowAdd:
+        s.showAdd = !s.showAdd;
+        SaveSettings();
+        g.cacheBox = -1;
+        RefreshAfterItemChange();
+        if (gGroup.shown) { PositionGroup(); RenderGroup(); }
+        RefreshPopupIfShown();
+        break;
     case kCmdRefreshIcons: RefreshAfterItemChange(); break;
     case kCmdOpenFolder: OpenConfigFolder(); break;
     case kCmdOpenTray: OpenSystemTray(); break;
@@ -2810,13 +3721,17 @@ void ShowMenu(int itemIndex) {
     GetCursorPos(&pt);
 
     HMENU menu = BuildMenu(itemIndex);
+    g.menuOpen = true;
+    if (g.hoverRevealed) RefreshRevealDeadline();
     SetForegroundWindow(g.hwnd);
     const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                    pt.x, pt.y, 0, g.hwnd, nullptr);
+    g.menuOpen = false;
     DestroyMenu(menu);
     PostMessageW(g.hwnd, WM_NULL, 0, 0);
 
     if (cmd) HandleCommand(cmd);
+    if (g.hoverRevealed) RefreshRevealDeadline();
 }
 // ------------------------------------------------------------------ wndproc ---
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2926,16 +3841,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 Render();
                 return 0;
             }
-            if (idx == pressed) LaunchItem(idx);
+            if (idx == pressed) {
+                if (IsDockItemGroup(idx)) OpenGroupAtItem(idx);
+                else LaunchItem(idx);
+            }
             return 0;
         }
 
-        if (idx == CenterIndex()) {
+        if (idx >= 0 && idx == CenterIndex()) {
             TogglePopup();
-        } else if (idx == AddIndex()) {
+        } else if (idx >= 0 && idx == AddIndex()) {
             AddViaDialog();
         } else if (idx >= 0 && idx < ItemCount()) {
-            LaunchItem(idx);
+            if (IsDockItemGroup(idx)) OpenGroupAtItem(idx);
+            else LaunchItem(idx);
         }
         return 0;
     }
@@ -2957,6 +3876,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == kSmartTimerId) {
             UpdateSmartHide();
+            return 0;
+        }
+        if (wp == kRevealTimerId) {
+            UpdateReveal();
             return 0;
         }
         if (wp == kClockTimerId) {
@@ -2990,6 +3913,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             gPopup.prevMouseDown = down;
             gPopup.prevEscapeDown = esc;
+            return 0;
+        }
+        if (wp == kGroupWatchTimerId) {
+            if (!gGroup.shown) return 0;
+            const bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            const bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+            if (esc && !gGroup.prevEscapeDown) HideGroup();
+            if (down && !gGroup.prevMouseDown) {
+                POINT p{};
+                GetCursorPos(&p);
+                RECT gr{}, dr{};
+                GetWindowRect(gGroup.hwnd, &gr);
+                GetWindowRect(g.hwnd, &dr);
+                const bool inGroup = p.x >= gr.left && p.x < gr.right && p.y >= gr.top && p.y < gr.bottom;
+                const bool inDock = p.x >= dr.left && p.x < dr.right && p.y >= dr.top && p.y < dr.bottom;
+                if (!inGroup && !inDock) HideGroup();
+            }
+            gGroup.prevMouseDown = down;
+            gGroup.prevEscapeDown = esc;
             return 0;
         }
         if (wp == kSystemTrayTimerId) {
@@ -3103,6 +4045,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         StopFullscreenWatch();
         HidePopup();
         if (gPopup.hwnd) DestroyWindow(gPopup.hwnd);
+        HideGroup();
+        if (gGroup.hwnd) DestroyWindow(gGroup.hwnd);
         if (g.clockTimerOn) {
             g.clockTimerOn = false;
             KillTimer(g.hwnd, kClockTimerId);
@@ -3223,6 +4167,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     if (gLabel.hwnd) DestroyWindow(gLabel.hwnd);
     HidePopup();
     if (gPopup.hwnd) DestroyWindow(gPopup.hwnd);
+    HideGroup();
+    if (gGroup.hwnd) DestroyWindow(gGroup.hwnd);
     DestroyIcon(g.trayIcon);
     Gdiplus::GdiplusShutdown(gdiplusToken);
     if (mutex) CloseHandle(mutex);
